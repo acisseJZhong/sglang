@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -591,25 +592,53 @@ class _PrefillAdmission:
     replay_len: int
 
 
-def mamba_prefill_chunk_grid() -> int:
+def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> int:
     """Grid a truncated prefill cut must land on, or 1 to leave the cut alone.
 
     DCP donates a mamba checkpoint only when the cached prefix is a whole
     number of kernel chunks from the extend start and also on the radix page.
     A cut off that grid costs the request every later donation. Without DCP,
     #40907 donates from a prefix-relative snapshot, so rounding the cut would
-    only drop up to one grid of prefill budget. A PrefillAdder built before
-    the server config is published, as in unit tests, also leaves the cut.
+    only drop up to one grid of prefill budget, except where windows retire
+    behind the checkpoints: under unified memory with window sub-pools and a
+    prefix-sharing ``tree_cache`` that keeps state checkpoints, a prefill
+    retires window rows only behind its latest checkpoint, and a chunk
+    shorter than the checkpoint grid takes none, so no row is retired. Every
+    cut there lands on that grid (the chunk that ends the prompt may stop
+    anywhere). A PrefillAdder built before the server config is published, as
+    in unit tests, also leaves the cut.
     """
     ctx = get_context()
     if not (
         ctx.is_config_namespace_published("exec")
         and ctx.is_config_namespace_published("parallel")
         and get_exec().mamba.enable_mamba_extra_buffer
-        and get_parallel().dcp_enabled
     ):
         return 1
-    return mamba_cache_chunk_size()
+    if get_parallel().dcp_enabled:
+        return mamba_cache_chunk_size()
+    if windows_retire_behind_checkpoints(tree_cache):
+        return mamba_checkpoint_grid(tree_cache.page_size)
+    return 1
+
+
+def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> bool:
+    """Whether a prefill retires window rows only behind the state checkpoints
+    its chunks take (unified memory with window sub-pools and a prefix-sharing
+    tree keeping checkpoints, without DCP): then no chunk but a prompt's last
+    may be cut below the checkpoint grid, whatever limits a pass sets."""
+    ctx = get_context()
+    return bool(
+        tree_cache is not None
+        and ctx.is_config_namespace_published("exec")
+        and ctx.is_config_namespace_published("parallel")
+        and ctx.is_config_namespace_published("memory")
+        and get_exec().mamba.enable_mamba_extra_buffer
+        and not get_parallel().dcp_enabled
+        and get_memory().enable_unified_memory
+        and tree_cache.window_sub_pools()
+        and tree_cache.window_checkpoint_interval() > 0
+    )
 
 
 class PrefillAdder:
@@ -639,7 +668,9 @@ class PrefillAdder:
         # that grid costs the request every later donation, so keep it there.
         # Without DCP the prefix-relative depth rule already donates, and
         # rounding would only shorten the chunk.
-        self.mamba_chunk_grid = mamba_prefill_chunk_grid()
+        self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
+        # Whether every cut must land on that grid, never below it.
+        self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -857,7 +888,26 @@ class PrefillAdder:
         """
         if self.mamba_chunk_grid <= 1 or trunc_len >= remaining:
             return trunc_len
-        return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
+        floored = trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid
+        if self.strict_chunk_grid:
+            # Below the grid a chunk takes no checkpoint; a continuation's
+            # limit was raised to one grid unit already
+            # (`grid_continuation_limit`).
+            return floored
+        return floored or trunc_len
+
+    def grid_continuation_limit(self, limit: int, remaining: int) -> int:
+        """The chunk limit of a continuing request after every runtime limit of
+        the pass (memory, a shortest-prefill reservation, mixed decode, a
+        dynamic chunk size) when cuts must land on the checkpoint grid
+        (`strict_chunk_grid`): on the grid, and when less than one grid unit
+        is left, one whole unit, so the request neither runs below the grid
+        nor starves behind limits that never leave a unit. The chunk that
+        ends the prompt may be shorter."""
+        if not self.strict_chunk_grid or limit >= remaining:
+            return limit
+        grid = self.mamba_chunk_grid
+        return max(limit // grid * grid, min(grid, remaining))
 
     def budget_state(self):
         no_token = (
@@ -1166,6 +1216,7 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
         prefix_tokens = 0
         if is_cp_sharded_padded():
             # Existing prefix padding can supply part of this chunk's KV rows.
