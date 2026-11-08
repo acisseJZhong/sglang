@@ -18,11 +18,25 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class ForwardStateSlots(NamedTuple):
+    """One forward's per-request recurrent-state slots as the state pool
+    indexes them, resolved while the forward prepared its metadata.
+
+    Work that belongs to the forward but runs after its metadata reads ended,
+    such as the post-verify state commit, reads these rather than the request
+    table and the slots' virtual-to-physical map: once those reads end, the
+    scheduler may rewrite both for a finished request's successor.
+    """
+
+    working: torch.Tensor  # one slot per request
+    track: Optional[torch.Tensor] = None  # prefix-cache checkpoint slots
 
 
 @dataclass(kw_only=True)
