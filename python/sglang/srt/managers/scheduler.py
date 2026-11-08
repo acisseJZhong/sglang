@@ -2277,6 +2277,7 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        self._pp_begin_capacity_round()
         recv_reqs = self.pause_state.take_inputs(
             received_reqs, stop_at_pause=stop_at_pause
         )

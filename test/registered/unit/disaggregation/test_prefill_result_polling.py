@@ -141,6 +141,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
+    _pp_begin_capacity_round = Scheduler._pp_begin_capacity_round
 
     def __init__(
         self,
@@ -195,6 +196,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
         self.pause_state = PauseState()
+        self._pp_capacity_relay = None
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_hierarchical_cache = False
