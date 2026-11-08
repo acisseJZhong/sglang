@@ -762,6 +762,17 @@ def handle_page_major_kv_layout(server_args: Any):
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
+        # A free returns ids and rewrites request rows on the scheduler's stream
+        # at once; the scheduler's write-after-read barrier, a stream wait on
+        # the running forward, keeps that forward from reading them rebound.
+        # On MPS (MLX included) the scheduler has no device streams to wait on.
+        if cfg.device == "mps":
+            raise ValueError(
+                "--enable-unified-memory is not supported on MPS: it orders the "
+                "scheduler's writes after the running forward's reads with "
+                "device stream waits, and the scheduler has no device streams "
+                "on MPS or MLX."
+            )
         declare_resolution(
             server_args,
             "_handle_page_major_kv_layout",

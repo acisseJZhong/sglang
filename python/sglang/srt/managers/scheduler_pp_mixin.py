@@ -112,11 +112,6 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
-        # FIXME: this loop never applies the write-after-read barrier
-        # (`Scheduler._apply_war_barrier`). Unified memory frees ids and
-        # rewrites request rows on the schedule stream at once and relies on
-        # this barrier, so an in-flight microbatch can read unbound or rebound
-        # mappings.
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -224,6 +219,8 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 # `self.last_batch` is the one reloaded for this micro-batch, so
                 # pass the batch this iteration launched.
@@ -377,6 +374,8 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -576,6 +575,8 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -600,6 +601,35 @@ class SchedulerPPMixin:
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+
+    def _pp_apply_war_barrier(self: Scheduler) -> None:
+        """Order the next schedule-stream writes after the shared reads of the
+        forward this iteration launched (`Scheduler._apply_war_barrier`).
+
+        Called at the end of an iteration that launched a micro-batch, before
+        the next one is scheduled. Those writes (allocation, request rows and
+        id mappings, zeroing, copies into a reused row) may land on rows an
+        unprocessed forward still reads: an aborted chunked request, whose
+        earlier chunks may still be running, frees its row at the next
+        scheduling, and the row can be handed out again at once. The forwards
+        launched before this one ran ahead of it on the forward stream, so its
+        read end covers theirs. PP's own sends would order these writes only
+        incidentally: a send waits its forward on the schedule stream, but with
+        `SGLANG_PP_COMM_OVERLAP` sends run on their own stream, and the last
+        stage sends nothing for a skipped output and, with an async batch
+        depth, sends an earlier forward's output.
+
+        It runs after the iteration's result processing, not right after the
+        launch, so a whole-forward wait does not hold the processed
+        micro-batch's output copy behind this forward. Nothing in between needs
+        it. What is freed there (the processed micro-batch's finished requests,
+        and PD requests that are in no batch) is in no unprocessed forward; a
+        request is in two unprocessed micro-batches only while chunked, and a
+        middle chunk's result commits nothing. What is allocated there was
+        freed either the same way or after the barrier of every forward that
+        read it.
+        """
+        self._apply_war_barrier()
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
