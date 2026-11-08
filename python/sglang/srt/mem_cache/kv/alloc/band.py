@@ -34,6 +34,7 @@ import functools
 import inspect
 import logging
 import os
+import sys
 from typing import (
     Dict,
     Generic,
@@ -73,6 +74,7 @@ from sglang.srt.mem_cache.kv.alloc.page_usage import (
     PageUsage,
 )
 from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkTransfer,
     NetworkWaiter,
     ReceiveHold,
     StreamTransfer,
@@ -490,6 +492,11 @@ class Band:
         # transfers, and pages a move vacated while readers could still read
         # them (`PageUsage`).
         self.usage = PageUsage()
+        # Pages a network transfer may still touch after its request is gone,
+        # by that transfer (`hold_orphaned_transfer`): fixed in place, and out
+        # of the free list until the transfer is released.
+        self._orphan_pages: Dict[int, Tuple[NetworkTransfer, Set[int]]] = {}
+        self._withheld: Set[int] = set()
         # Move batches that may have moved a held receive row (one issued
         # while a hold is open and not fixed in place), and whether a relief
         # has the held rows fixed now.
@@ -595,7 +602,15 @@ class Band:
             self.watermark_physical = self.num_pages - 1
 
     def clear(self) -> None:
-        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        """Reset to initial state. Pages in `[0, min_page_index)` are reserved.
+
+        While a network transfer that is not released may still touch some of
+        its bytes, the band frees every page instead and keeps what protects
+        them (`_clear_keeping_network_transfers`): a reset would hand those
+        bytes out."""
+        if self._holds_unreleased_network_transfer():
+            self._clear_keeping_network_transfers()
+            return
         self._reset_watermarks()
         self.ids.reset()
         if self.is_id_owner:
@@ -625,6 +640,54 @@ class Band:
         self._pending_host = []
         self.usage.reset()
         self._capacity_epoch += 1  # fixed pages are capacity-bearing
+
+    def _holds_unreleased_network_transfer(self) -> bool:
+        if self._orphan_pages:
+            return True
+        return any(
+            isinstance(key, NetworkTransfer) and not key.released
+            for use in self.usage.uses
+            for key in keys_of(use.release if use.release is not None else use.signal)
+        )
+
+    def _clear_keeping_network_transfers(self) -> None:
+        """A clear that frees every page through the one release path instead
+        of resetting the band: pages pending on a forward (none is in flight
+        at a clear) and every live page go back, and the ledger keeps what
+        protects bytes an unreleased network transfer may touch (its fences,
+        and its withheld and fixed pages), so they are neither handed out nor
+        moved over. The geometry stays; compaction retreats it later."""
+        steps = self.forward_steps
+        assert steps is None or not steps.in_flight(), (
+            f"{self.sub_pool_name}: a clear with a forward in flight"
+        )
+        ready, _ = self._pending_until_retire.processed_through(sys.maxsize)
+        self._pending_until_retire = NO_PENDING_PAGES
+        host = self._pending_host
+        self._pending_host = []
+        if ready:
+            self.release(ready, Release.FREE, host=host)
+        bound = self.ids.physical_to_virtual[self.min_page_index : self.num_pages]
+        live = torch.nonzero(bound >= 0).flatten() + self.min_page_index
+        if live.numel():
+            self.free_physical(self._expand_pages_to_tokens(live))
+        self.live_page_count = 0
+        self.ids.reset()
+        if self.is_id_owner:
+            self.free_virtual_ids = torch.arange(
+                self.min_page_index,
+                self.num_pages,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            self.free_virtual_ids = None
+        self.free_group = None
+        self.free_page_reps_group = None
+        self._inverse_history.clear()
+        self.usage.prune()
+        self._holes_dirty = True
+        self._capacity_epoch += 1
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
@@ -1849,11 +1912,19 @@ class Band:
         writes)``, with ``host`` naming the pages) are transfers still on the
         pages; they fence them for `acquire` to clear. The per-step `free`
         passes none: a host copy runs only over rows its owner keeps locked
-        until it ends, and a network transfer's rows are freed only once it is
-        released. No device read."""
+        until it ends, and the pages of a network transfer whose request is
+        gone before its release are withheld instead
+        (`hold_orphaned_transfer`). No device read, but while pages are
+        withheld and ``host`` is None."""
         parts = [pages] if isinstance(pages, torch.Tensor) else list(pages)
         if sum(part.numel() for part in parts) == 0:
             return
+        if self._withheld:
+            # A page held for an orphaned transfer never joins the free list
+            # (rare: a host read).
+            parts, host = self._divert_withheld(parts, host)
+            if not host:
+                return
         known = self._host_free
         self._free_pages = torch.cat([self._free_phys_pages, *parts])
         if known is None or host is None:
@@ -2163,6 +2234,93 @@ class Band:
             self._wait_on_stream(keys)
         if writer is not None:
             self._retire_through(writer)
+
+    # -- network transfers whose request is gone --
+
+    def hold_orphaned_transfer(self, transfer: NetworkTransfer) -> Set[int]:
+        """The request of ``transfer`` gave its rows back before the transfer
+        was released: keep every page of this band's span it reads or writes
+        out of reuse until it is (`end_orphaned_transfer`). The pages are
+        fixed: no move takes one away or over one, and every plan keeps them
+        inside the band. Holes among them leave the free list now, and pages
+        freed later (`release`) never join it: both wait as pending pages
+        under the transfer, which no drain returns while they are fixed and
+        every layout counts as occupied. A page a last-resort move left
+        beyond the span is no page of the band: its fence holds its bytes
+        (`ChainAllocator.network_held_bytes`). Returns the pages held. Reads
+        the transfer's rows and the free list on the host."""
+        uses = [use for use in self.usage.transfers() if use.release is transfer]
+        if not uses:
+            return set()
+        touched: Set[int] = set()
+        for use in uses:
+            touched |= self._use_physical_pages(use)
+        first, end = self._span_range()
+        pages = {page for page in touched if first <= page < end}
+        if not pages:
+            return set()
+        self._orphan_pages[id(transfer)] = (transfer, pages)
+        self._withheld |= pages
+        self.fix_pages(transfer, sorted(pages))
+        free = self._free_pages_snapshot()
+        holes = sorted(pages.intersection(free))
+        if holes:
+            taken = set(holes)
+            rest = [page for page in free if page not in taken]
+            self._set_free_pages(
+                torch.tensor(rest, dtype=torch.int64, device=self.device), host=rest
+            )
+            self._withhold(transfer, holes)
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+        return pages
+
+    def end_orphaned_transfer(self, transfer: NetworkTransfer) -> None:
+        """``transfer`` was released: its pages may move again, and those held
+        out of the free list join it at the next drain (their key ended)."""
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+        if self._orphan_pages.pop(id(transfer), None) is None:
+            return
+        self._withheld = set().union(
+            *(pages for _, pages in self._orphan_pages.values())
+        )
+        self.unfix_pages(transfer)
+
+    def withheld_page_count(self, transfers=None) -> int:
+        """Pages held for orphaned transfers: all, or ``transfers``'."""
+        return sum(
+            len(pages)
+            for key, (transfer, pages) in self._orphan_pages.items()
+            if transfers is None or any(transfer is t for t in transfers)
+        )
+
+    def _withhold(self, transfer: NetworkTransfer, pages: List[int]) -> None:
+        """Keep free ``pages`` out of the free list as pending under
+        ``transfer``: they return once it is released and they are unfixed."""
+        self.usage.vacate(
+            transfer,
+            (),
+            page_bytes=self.entry_bytes_per_page,
+            pages=pages,
+            batch=torch.tensor(pages, dtype=torch.int64, device=self.device),
+        )
+
+    def _divert_withheld(self, parts: List[torch.Tensor], host: Optional[List[int]]):
+        """Split pages on their way to the free list: those held for an
+        orphaned transfer are withheld under it instead. Returns the rest, as
+        tensors and on the host. Reads the pages on the host when ``host`` is
+        None."""
+        if host is None:
+            host = torch.cat(parts).tolist()
+        if self._withheld.isdisjoint(host):
+            return parts, host
+        kept = [page for page in host if page not in self._withheld]
+        for transfer, pages in self._orphan_pages.values():
+            withheld = [page for page in host if page in pages]
+            if withheld:
+                self._withhold(transfer, withheld)
+        return [torch.tensor(kept, dtype=torch.int64, device=self.device)], kept
 
     def _fence_vacated(self, pages: Sequence[int], readers: tuple = ()) -> None:
         """``pages`` were vacated while the newest recorded forward, and the
@@ -3506,7 +3664,9 @@ class FloatBand(Band):
                 .sum()
                 .item()
             )
-            pending = self._pending_until_retire_pages
+            # Pages pending until their step is processed, and pages pending
+            # on a network transfer (held for an orphaned one).
+            pending = self._pending_until_retire_pages + len(self.usage.pending_pages)
             if self._span_pages() != bound + self._hole_pages() + pending:
                 out.append(
                     f"[{self.sub_pool_name}] float span {self._span_pages()} != "
