@@ -747,7 +747,8 @@ class TestThreeWindowTree(CustomTestCase):
                 )
                 for ct, name in zip(slots, names):
                     self.assertEqual(
-                        cache.window_available_size(name), a.units_available(name)
+                        cache.window_available_size(name),
+                        a.estimated_units_available(name),
                     )
                 ct, name = slots[victim], names[victim]
                 before = {
@@ -769,7 +770,8 @@ class TestThreeWindowTree(CustomTestCase):
                 cache.unlock(lock)
                 # A demand on this window alone is reclaimed for it alone.
                 held = {b.sub_pool_name: b.allocated_count() for b in a.bands}
-                pages = -(-a.units_available(name) // 4) + 1
+                # More than the estimate, an upper bound: only a reclaim fits it.
+                pages = -(-a.estimated_units_available(name) // 4) + 1
                 cache.evict_for_alloc(KVDemand(window_tokens={name: pages * 4}))
                 self.assertTrue(a.units_fit({name: pages}))
                 after = {b.sub_pool_name: b.allocated_count() for b in a.bands}

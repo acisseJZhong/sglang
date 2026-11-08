@@ -288,11 +288,8 @@ class TestUnifiedWindowLengths(CustomTestCase):
         self.assertEqual(primary_window(_WINDOWS), _TARGET_WINDOW)
         self.assertEqual(primary_window((8, None, 4)), None)
         for name in (storage.owner, *storage.retained_window_lengths()):
-            self.assertEqual(
-                storage.available_units(name),
-                storage.allocator.units_available(name),
-                name,
-            )
+            self.assertTrue(storage.units_fit(name, 1), name)
+            self.assertFalse(storage.units_fit(name, 1 << 30), name)
 
     def test_window_retirement_names_its_window(self):
         """A pool of several windows has no default window to retire."""
