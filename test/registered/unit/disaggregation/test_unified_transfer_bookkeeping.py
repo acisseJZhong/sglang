@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation import prefill
@@ -974,6 +975,91 @@ class TestTheLedgerHoldsAFailedTransfersPages(CustomTestCase):
                 owner.flush_opportunistic()
                 allocator.clear()
                 self.assertEqual(allocator.available_size(), total)
+
+    def test_bytes_a_gone_send_may_read_beyond_the_span_stay_out_of_use(self):
+        """REGRESSION: an urgent flush moved a row an in-flight send still
+        read and retreated the frontier past the bytes it vacated, fenced on
+        the send. Once the send failed unproven, a growth over them waited for
+        a transfer that may never end, and the planner's last resort placed
+        layouts over them. No frontier grows into them and no layout uses
+        them until the send is released, and nothing waits."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        proof = {"done": False}
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        req = SimpleNamespace(rid="s", bootstrap_room=11, kv=ReqKvInfo())
+        self.assertIsNotNone(storage.acquire([req]))
+        ids = owner.alloc(8 * page)
+        # The page nearest the frontier is the first a compaction moves.
+        top = set(_physical_pages(owner, ids[:page]))
+        _record(allocator, req, sorted(top), writes=False, peer=proof)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        self.assertGreater(owner.flush_for_allocation(), 0)
+        first, end = owner._span_range()
+        self.assertFalse(any(first <= p < end for p in top), "left beyond")
+        # The send fails unproven; its request is gone; past the bound.
+        owner.free(torch.cat([ids[: 2 * page], ids[6 * page :]]))
+        storage.release_row(req)
+        with self.assertLogs(utils_mod.logger, level="ERROR"):
+            _reaper(storage, quarantine_after=0.0).resolve()
+        e = owner.entry_bytes_per_page
+        withheld = allocator.pricing_snapshot().withheld
+        self.assertTrue(all(any(lo <= p * e < hi for lo, hi in withheld) for p in top))
+        # No network waiter is installed: a wait would raise.
+        taken = owner.alloc(owner.available_size())
+        self.assertIsNotNone(taken)
+        self.assertTrue(top.isdisjoint(_physical_pages(owner, taken)))
+        owner.free(taken)
+        proof["done"] = True
+        _reaper(storage).resolve()
+        self.assertEqual(allocator.pricing_snapshot().withheld, ())
+
+    def test_an_end_compacts_around_a_gone_transfers_pages(self):
+        """A gone transfer's pages are fixed, never a reason to stop moving the
+        band's other pages: the planner prices the end compacted around them,
+        as around any fixed page, its flush realizes that extent, and neither
+        moves nor hands them out."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, _fixed_takes
+
+        req = SimpleNamespace(rid="e", bootstrap_room=12, kv=ReqKvInfo())
+        self.assertIsNotNone(storage.acquire([req]))
+        ids = owner.alloc(16 * page)
+        pages = _physical_pages(owner, ids[::page])
+        first, end = owner._span_range()
+        base = end - 1 if owner.grow_direction == "down" else first
+        # Two live pages at the frontier; the transfer's page third from the
+        # base, so the end packs exactly up to it.
+        by_base = sorted(range(16), key=lambda i: abs(pages[i] - base))
+        live, sent = by_base[-2:], by_base[2]
+        held = pages[sent]
+        _record(allocator, req, [held], writes=False, peer={"done": False})
+        owner.free(
+            torch.cat(
+                [ids[i * page : (i + 1) * page] for i in range(16) if i not in live]
+            )
+        )
+        storage.release_row(req)
+        self.assertEqual(owner.fixed_pages(), {held})
+        snapshot = allocator.pricing_snapshot()
+        band = snapshot.bands[snapshot.index(owner.sub_pool_name)]
+        (take,) = _fixed_takes(
+            band, 0, step=FLUSH_ENDS, total_bytes=snapshot.total_bytes
+        )
+        e = band.page_bytes
+        packed = (min(base, held), max(base, held) + 1)
+        self.assertEqual((take.low_byte // e, take.high_byte // e), packed)
+        self.assertGreater(owner.flush_for_allocation(), 0)
+        self.assertEqual(owner._span_range(), packed)
+        self.assertEqual(owner.fixed_pages(), {held}, "never moved")
+        taken = owner.alloc(owner.available_size())
+        self.assertNotIn(held, _physical_pages(owner, taken))
+        owner.free(taken)
 
     def test_a_pool_clear_without_transfers_resets(self):
         allocator, storage = _tri_pool()

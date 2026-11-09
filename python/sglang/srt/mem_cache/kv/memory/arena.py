@@ -96,6 +96,11 @@ class KVArena:
         self._sink = sink_bytes
         self._vmm_owner = None
         self.page_parts = {}
+        # Byte ranges outside every band that a network transfer whose request
+        # is gone may still touch, by (band name, transfer): no band grows into
+        # them and no layout uses them until it is released, since nothing may
+        # wait for it (`Band.hold_orphaned_transfer`).
+        self.withheld: Dict[Tuple[str, int], Tuple[Tuple[int, int], ...]] = {}
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
