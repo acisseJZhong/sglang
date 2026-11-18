@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
@@ -62,6 +64,43 @@ _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
 
+# The per-request ForwardBatch fields a linear backend's extend metadata reads,
+# beyond the request-slot tensors (sliced to the real requests of a full prefill
+# CUDA graph batch, see MambaAttnBackendBase._full_prefill_graph_view).
+_PER_REQUEST_EXTEND_FIELDS = (
+    "req_pool_indices",
+    "extend_seq_lens",
+    "extend_prefix_lens",
+    "extend_prefix_lens_cpu",
+    "mamba_prefill_track_mask_cpu",
+    "mamba_track_seqlens_cpu",
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+)
+
+
+@dataclass
+class _FullPrefillGraphState:
+    """What full prefill CUDA graphs capture a linear backend's extend on.
+
+    The prefill runner captures one graph per token bucket over a fixed request
+    axis of ``req_slots`` rows: a batch's requests, then zero-length sentinel
+    rows, whose state slot is PAD_SLOT_ID. Before each capture and replay
+    ``init_forward_metadata_out_graph`` refreshes these in place.
+    """
+
+    req_slots: int
+    # The breakable prefill graph tables of every captured bucket (bucket token
+    # count -> the backend's init_prefill_graph_metadata result), for backends
+    # whose extend runs on them; None for backends that capture their extend on
+    # the static forward metadata below.
+    tables: Optional[dict[int, Any]]
+    state_indices: torch.Tensor  # [req_slots] int32
+    query_start_loc: torch.Tensor  # [req_slots + 1] int32
+    # Track destinations of the extra_buffer prefix cache; padding rows 0.
+    track_indices: torch.Tensor  # [req_slots] int64
+
 
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
@@ -83,6 +122,18 @@ class MambaAttnBackendBase(AttentionBackend):
     # Most sequences the prefill graph tables hold (larger batches replay no
     # graph); set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
+
+    # Whether the extend reads the batch only through the device tensors of
+    # forward_metadata (mamba_cache_indices, query_start_loc) and the batch's
+    # static request buffers (e.g. extend_prefix_lens), on launch grids that
+    # depend only on the token count: full prefill CUDA graphs then capture it on
+    # static copies of that metadata. Backends with prefill graph tables
+    # (supports_full_prefill_graph_tables) need not set it.
+    captures_extend_on_forward_metadata: bool = False
+
+    # Set by init_prefill_cuda_graph_state when the prefill runner captures full
+    # graphs.
+    _full_prefill_graph: Optional[_FullPrefillGraphState] = None
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -190,6 +241,107 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def refresh_prefill_graph_metadata(self, meta, forward_batch: ForwardBatch):
         raise NotImplementedError()
+
+    def supports_full_prefill_graph_tables(self) -> bool:
+        """Whether full prefill CUDA graphs can capture the extend on the
+        breakable prefill graph tables (init_prefill_graph_metadata)."""
+        return self.supports_prefill_graph_extend()
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        if self.supports_full_prefill_graph_tables():
+            if max_req_slots > self.prefill_graph_max_seqs:
+                raise ValueError(
+                    f"full_prefill_max_req={max_req_slots} exceeds the "
+                    f"{self.prefill_graph_max_seqs} sequences {type(self).__name__}'s "
+                    "captured extend holds; lower full_prefill_max_req"
+                )
+            tables = {}
+        elif self.captures_extend_on_forward_metadata:
+            if get_exec().mamba.enable_mamba_extra_buffer:
+                raise ValueError(
+                    f"Full prefill CUDA graphs of {type(self).__name__} do not "
+                    "support the extra_buffer mamba prefix cache; use "
+                    "--cuda-graph-backend-prefill breakable"
+                )
+            tables = None
+        else:
+            raise ValueError(
+                f"{type(self).__name__} cannot run its extend inside full prefill "
+                "CUDA graphs; use --cuda-graph-backend-prefill breakable"
+            )
+        self._full_prefill_graph = _FullPrefillGraphState(
+            req_slots=max_req_slots,
+            tables=tables,
+            state_indices=torch.full(
+                (max_req_slots,), PAD_SLOT_ID, dtype=torch.int32, device=self.device
+            ),
+            query_start_loc=torch.zeros(
+                (max_req_slots + 1,), dtype=torch.int32, device=self.device
+            ),
+            track_indices=torch.zeros(
+                (max_req_slots,), dtype=torch.int64, device=self.device
+            ),
+        )
+
+    def _full_prefill_graph_view(self, forward_batch: ForwardBatch) -> ForwardBatch:
+        """The batch's real requests, without the sentinel rows the prefill runner
+        pads the request axis with (a real extend has at least one token)."""
+        lens = list(forward_batch.extend_seq_lens_cpu)
+        while lens and lens[-1] == 0:
+            lens.pop()
+        bs = len(lens)
+        view = copy.copy(forward_batch)
+        view.batch_size = bs
+        view.extend_seq_lens_cpu = lens
+        for name in _PER_REQUEST_EXTEND_FIELDS:
+            values = getattr(forward_batch, name, None)
+            if values is not None:
+                setattr(view, name, values[:bs])
+        return view
+
+    def _init_full_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ) -> None:
+        state = self._full_prefill_graph
+        assert forward_batch.batch_size == state.req_slots, (
+            f"{forward_batch.batch_size=} != {state.req_slots=}"
+        )
+        view = self._full_prefill_graph_view(forward_batch)
+        bs = view.batch_size
+        if state.tables is not None:
+            # The bucket's static input slot, at capture and replay alike.
+            num_tokens = forward_batch.input_ids.shape[0]
+            if in_capture:
+                state.tables[num_tokens] = self.init_prefill_graph_metadata(view)
+            else:
+                self.refresh_prefill_graph_metadata(state.tables[num_tokens], view)
+        else:
+            indices = self._translate_mamba_indices(
+                self.req_to_token_pool.get_mamba_indices(view.req_pool_indices)
+            )
+            state.state_indices[:bs].copy_(indices)
+            state.state_indices[bs:].fill_(PAD_SLOT_ID)
+            # Padding rows are empty sequences (query_start_loc[0] stays 0); the
+            # bucket's padding tokens follow the last sequence and belong to none.
+            torch.cumsum(
+                forward_batch.extend_seq_lens[: state.req_slots],
+                dim=0,
+                dtype=torch.int32,
+                out=state.query_start_loc[1:],
+            )
+            self.forward_metadata = ForwardMetadata(
+                query_start_loc=state.query_start_loc,
+                mamba_cache_indices=state.state_indices,
+            )
+        # Captured readers of this forward's track slots index the runner's
+        # request axis, not the requests of the capture batch.
+        track_indices = self.forward_metadata.mamba_track_indices
+        if track_indices is not None:
+            state.track_indices[:bs].copy_(track_indices)
+            state.track_indices[bs:].zero_()
+            self.forward_metadata.mamba_track_indices = state.track_indices
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -437,6 +589,12 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self._full_prefill_graph is not None and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            self._init_full_prefill_graph_metadata(forward_batch, in_capture)
+            return
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
@@ -1486,6 +1644,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_prefill_cuda_graph_state(
+                max_num_tokens=max_num_tokens, max_req_slots=max_req_slots
+            )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

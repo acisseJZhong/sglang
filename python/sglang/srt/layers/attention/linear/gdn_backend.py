@@ -756,6 +756,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and self._prefill_graph_extend_supported()
         )
 
+    def supports_full_prefill_graph_tables(self) -> bool:
+        # A full graph has no eager break to keep, so the experimental opt-in of
+        # breakable graphs (SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND) does not gate it.
+        # Only the Triton chain runs on the tables outside an external body.
+        return (
+            not self.is_draft_worker
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and self._prefill_graph_extend_supported()
+        )
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        if not isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            raise ValueError(
+                "Full prefill CUDA graphs run the GDN extend on the Triton kernel; "
+                "use --linear-attn-prefill-backend triton, or "
+                "--cuda-graph-backend-prefill breakable"
+            )
+        super().init_prefill_cuda_graph_state(
+            max_num_tokens=max_num_tokens, max_req_slots=max_req_slots
+        )
+
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             external_prefill_body,

@@ -4,7 +4,9 @@ The Qwen3-8B test checks end-to-end accuracy with FlashInfer. The smaller
 DeepSeek-Coder-V2-Lite test checks that an MLA radix-prefix hit selects the
 OSS FA4 cached-prefix graph variant and matches an eager cold request.
 The EAGLE3 test checks that target prefills replay FullCG rather than silently
-falling back to eager while speculative decoding remains active.
+falling back to eager while speculative decoding remains active. The Qwen3.5
+test checks that a hybrid linear attention (GDN) model replays FullCG, cached
+prefixes included, with the same tokens and logprobs as breakable graphs.
 
 The attention backend is pinned to flashinfer: plain EXTEND under full
 CUDA graph requires the backend's init_forward_metadata_out_graph to
@@ -29,11 +31,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
-register_cuda_ci(est_time=258, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=410, stage="extra-b", runner_config="4-gpu-b200")
 
 
 def _prefill_graph_count(base_url: str) -> float:
@@ -151,6 +154,71 @@ class TestFullCudaGraphPrefillWithEagle3(Eagle3Base):
         self.assertGreater(output["meta_info"]["spec_verify_ct"], 0)
         self.assertGreater(output["meta_info"]["spec_num_proposed_drafts"], 0)
         self.assertEqual(_prefill_graph_count(self.base_url), graph_count + 1)
+
+
+class TestFullCudaGraphPrefillHybridLinear(CustomTestCase):
+    """Qwen3.5 (GDN layers) replays full prefill CUDA graphs for new and
+    cached-prefix extends, with the tokens and logprobs of breakable graphs.
+
+    Before #48593's fix, full capture raised IndexError in the hybrid linear
+    attention backend, whose extend metadata the prefill runner never sized."""
+
+    model = "Qwen/Qwen3.5-0.8B"
+    # Past the 256-token mamba track interval, so the second round resumes a
+    # cached recurrent state.
+    prefix = list(range(1000, 1600))
+    suffixes = [
+        list(range(2000 + 100 * i, 2000 + 100 * i + 8 * (i + 1))) for i in range(4)
+    ]
+
+    def _run(self, prefill_backend):
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            self.model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--attention-backend=flashinfer",
+                # Full graphs capture the Triton GDN extend; SM90/SM100 may
+                # default to FlashInfer's.
+                "--linear-attn-prefill-backend=triton",
+                "--enable-metrics",
+                "--mem-fraction-static=0.6",
+                f"--cuda-graph-backend-prefill={prefill_backend}",
+            ],
+        )
+        try:
+            graph_count = _prefill_graph_count(base_url)
+            outputs = []
+            # A batch of new prompts, then the same prompts on the cached prefix.
+            for _ in range(2):
+                response = requests.post(
+                    base_url + "/generate",
+                    json={
+                        "input_ids": [self.prefix + s for s in self.suffixes],
+                        "sampling_params": {"max_new_tokens": 16, "temperature": 0},
+                        "return_logprob": True,
+                    },
+                    timeout=120,
+                )
+                response.raise_for_status()
+                outputs.append(response.json())
+            return outputs, _prefill_graph_count(base_url) - graph_count
+        finally:
+            terminate_and_kill_process_tree(process)
+
+    def test_matches_breakable_prefill_graphs(self):
+        full, full_replays = self._run("full")
+        breakable, _ = self._run("breakable")
+        self.assertGreater(full_replays, 0)
+        self.assertGreater(full[1][0]["meta_info"]["cached_tokens"], 0)
+        for full_round, breakable_round in zip(full, breakable, strict=True):
+            for f, b in zip(full_round, breakable_round, strict=True):
+                self.assertEqual(f["output_ids"], b["output_ids"])
+                self.assertEqual(
+                    f["meta_info"]["output_token_logprobs"],
+                    b["meta_info"]["output_token_logprobs"],
+                )
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
